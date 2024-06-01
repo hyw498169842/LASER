@@ -1,0 +1,13 @@
+__pycache__/
+
+dataset/tpch/tpch-tables/
+dataset/tpch/tpch-queries/
+
+dataset/tpcds/tpcds-tables/
+dataset/tpcds/tpcds-queries/
+
+dataset/job/job-queries/
+
+dataset/sysbench/sysbench-queries/
+
+stats.txt
