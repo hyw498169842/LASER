@@ -43,7 +43,7 @@ def get_all_queueing_query_ids():
     all_queueing_query_ids = []
     for i, dq in enumerate(QUERY_QUEUES):
         with QUERY_QUEUE_LOCKS[i]:
-            all_queueing_query_ids += [qid for qid, _, _, _ in dq]
+            all_queueing_query_ids += [qid for qid, _, _, _, _, _, _ in dq]
             dq.clear()
     return all_queueing_query_ids
 

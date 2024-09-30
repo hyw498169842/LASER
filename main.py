@@ -34,6 +34,7 @@ if __name__ == "__main__":
         "FIX": FIXAllocator, 
         "MIN": MINAllocator,
         "QCK": QCKAllocator,
+        "CAS": CASAllocator,
         "ML": CacheBasedAllocator
     }
     AllocatorClass = allocator_dict[args.allocator]
@@ -197,7 +198,7 @@ if __name__ == "__main__":
                     for i in range(1, N_WORKERS):
                         idx = (longest_queue_index + i) % N_WORKERS # check for worker {idx}
                         if cur_queue_length[idx] == 0 and QUERY_QUEUES[longest_queue_index]:
-                            for steal_index, (qid, _, _, _) in enumerate(QUERY_QUEUES[longest_queue_index]):
+                            for steal_index, (qid, _, _, _, _, _, _) in enumerate(QUERY_QUEUES[longest_queue_index]):
                                 # do not steal write queries (from master)
                                 if not queries[qid].is_write:
                                     with QUERY_QUEUE_LOCKS[idx]:

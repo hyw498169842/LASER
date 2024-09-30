@@ -1,0 +1,1 @@
+{"sql": "SELECT * FROM delivery(%s, %s, %s, %s)", "args": [12, 9, 10, 915316199.109524], "type": "delivery"}

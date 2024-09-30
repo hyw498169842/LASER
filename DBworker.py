@@ -122,20 +122,20 @@ class DBworker(Process):
                 if not self.query_queue:
                     break
                 if not self.use_ml_method:
-                    self.query_buffer.append(self.query_queue[0][:2])
+                    self.query_buffer.append(self.query_queue[0][:2] + self.query_queue[0][4:])
                     self.query_queue.popleft()
                 else:
                     # select the query with the best score
                     dists, costs, total_cost = [], [], 0
-                    for _, _, cost, cache_state in self.query_queue:
-                        dists.append(np.linalg.norm(self.db_cache_state - cache_state, ord=1))
+                    for _, _, cost, cache_state, _, _, _ in self.query_queue:
+                        dists.append(np.linalg.norm(self.db_cache_state - cache_state, ord=1) / N_BUCKETS / (N_TABLES + N_INDEXES))
                         costs.append(cost)
                         total_cost += cost
                     best_idx = np.argmin([dist + self.w_s * (cost / total_cost) for dist, cost in zip(dists, costs)])
-                    self.query_buffer.append(self.query_queue[best_idx][:2])
+                    self.query_buffer.append(self.query_queue[best_idx][:2] + self.query_queue[best_idx][4:])
                     # update using ema
                     self.db_cache_state = (1 - self.ema_weight) * self.db_cache_state + \
-                                          self.ema_weight * self.query_queue[best_idx][-1]
+                                          self.ema_weight * self.query_queue[best_idx][3]
                     # remove the query from original queue
                     del self.query_queue[best_idx]
     
@@ -209,8 +209,8 @@ class DBworker(Process):
                     break
                 handler.is_busy = True
                 with handler.lock:
-                    qid, query_str = self.query_buffer.popleft()
-                    handler.query_info = qid, query_str
+                    qid, query_str, txn_str, txn_args, txn_type = self.query_buffer.popleft()
+                    handler.query_info = qid, query_str, txn_str, txn_args, txn_type
                     if self.use_ml_method:
                         self.query_start_time[qid] = time.time() - self.start_time.value
             # select the new "best" queries

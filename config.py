@@ -65,5 +65,7 @@ elif os.environ["DATASET"] == "job":
     from dataset.job.config import *
 elif os.environ["DATASET"] == "sysbench":
     from dataset.sysbench.config import *
+elif os.environ["DATASET"] == "htap":
+    from dataset.htap.config import *
 else:
     raise NotImplementedError("Dataset not supported")

@@ -1,0 +1,1 @@
+{"sql": "SELECT * FROM stock_level(%s, %s, %s)", "args": [62, 4, 17], "type": "stock_level"}

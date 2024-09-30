@@ -56,7 +56,18 @@ def get_new_cached_pages(cache_state_before, cache_state_after, tables):
     ''' Extract the pages that are newly cached after the query '''
     all_keys = tables + [f"{table}_pkey" for table in tables]
     if os.environ["DATASET"] == "sysbench":
-        all_keys += ["k_" + table[-1] for table in tables]
+        tids = ["".join([c for c in table if c.isdigit()]) for table in tables]
+        all_keys += ["k_" + tid for tid in tids]
+    elif os.environ["DATASET"] == "htap":
+        for i in range(len(all_keys)):
+            if all_keys[i].endswith("_pkey"):
+                all_keys[i] = all_keys[i][:-2]
+        if "order_line" in tables:
+            all_keys += ["fkey_order_line"]
+        if "customer" in tables:
+            all_keys += ["idx_customer"]
+        if "orders" in tables:
+            all_keys += ["idx_orders"]
     old_pages_dict = {key: dict() for key in all_keys}
     for relation, pageid, usage in cache_state_before:
         if relation in old_pages_dict.keys():

@@ -1,0 +1,3 @@
+[submodule "dataset/htap/s64da-benchmark-toolkit"]
+	path = dataset/htap/s64da-benchmark-toolkit
+	url = https://github.com/swarm64/s64da-benchmark-toolkit

@@ -1,19 +1,25 @@
+import re
 import time
 import torch
 import heapq
+import sqlglot
+import sqlglot.expressions as exp
 from threading import Lock
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
 
 from config import *
 from shared import *
 from utils import extract_tables
+from DBmonitor import DB_MONITOR
 
 
 def send_to(wid, query, cache_state=None):
     with QUERY_QUEUE_LOCKS[wid]:
         if cache_state is not None:
-            QUERY_QUEUES[wid].append((query.qid, query.query_str, query.cost, cache_state.detach().numpy()))
+            QUERY_QUEUES[wid].append((query.qid, query.query_str, query.cost, cache_state.detach().numpy(), query.txn_str, query.txn_args, query.txn_type))
         else:
-            QUERY_QUEUES[wid].append((query.qid, query.query_str, None, None))
+            QUERY_QUEUES[wid].append((query.qid, query.query_str, None, None, query.txn_str, query.txn_args, query.txn_type))
 
 
 class RRAllocator:
@@ -70,11 +76,212 @@ class QCKAllocator:
                 queueing_time = [0 for _ in range(self.n_workers)]
                 for i in range(self.n_workers):
                     with QUERY_QUEUE_LOCKS[i]:
-                        for qid, _, _, _ in QUERY_QUEUES[i]:
+                        for qid, _, _, _, _, _, _ in QUERY_QUEUES[i]:
                             queueing_time[i] += time.time() - self.alloc_time[qid]
                 send_to(queueing_time.index(min(queueing_time)), query)
             self.alloc_time[query.qid] = time.time()
     
+
+class CASAllocator:
+    def __init__(self, n_workers=N_WORKERS):
+        self.n_workers = n_workers
+        self.len_sig = 128  # signature length
+        self.len_hist = 8   # history length
+        self.histories = [
+            deque(maxlen=self.len_hist) for _ in range(self.n_workers)
+        ]
+        self.max_values, self.min_values = dict(), dict()
+    
+    def is_number_expr(self, expr):
+        try:
+            return type(eval(expr)) in [int, float]
+        except:
+            return False
+    
+    def convert_date_to_number(self, date_str):
+        date = re.findall(r"(\d+-\d+-\d+)", date_str)[0]
+        date = datetime.strptime(date, "%Y-%m-%d")
+        if "INTERVAL" in date_str:
+            interval = date_str.split(" INTERVAL ")[-1].strip("()")
+            num, unit = interval.split()
+            if unit == "day":
+                delta = relativedelta(days=int(num.strip("'")))
+            elif unit == "month":
+                delta = relativedelta(months=int(num.strip("'")))
+            elif unit == "year":
+                delta = relativedelta(years=int(num.strip("'")))
+            # apply interval
+            if " + INTERVAL " in date_str:
+                date += delta
+            else:
+                date -= delta
+        return (date - datetime.strptime("1970-01-01", "%Y-%m-%d")).days
+
+    def merge_signature(self, sig_dict, table, col, signature):
+        if (table, col) not in sig_dict:
+            sig_dict[(table, col)] = signature
+        else:
+            sig_dict[(table, col)] = [min(a, b) for a, b in zip(sig_dict[(table, col)], signature)]
+    
+    def get_table_by_col(self, identifier, alias_dict):
+        if "." in identifier:
+            table, col = identifier.split(".")
+        else:
+            table, col = None, identifier
+        # replace with orignal name
+        if col in alias_dict:
+            col = alias_dict[col]
+        if table in alias_dict:
+            table = alias_dict[table]
+        # get all possible tables
+        tables = DB_MONITOR.get_tables_by_col(col)
+        if not tables:
+            table = None
+        elif len(tables) == 1:
+            table = tables[0]
+        elif len(tables) > 1:
+            assert table in tables
+        return table, col
+
+    def get_query_signature(self, query):
+        parsed = sqlglot.parse_one(query.query_str)
+        alias_dict = dict()
+        for expr in parsed.find_all(exp.Alias, exp.Table):
+            if str(expr).count(" AS ") == 1:
+                origin, alias = str(expr).split(" AS ")
+                alias_dict[alias] = origin
+        all_predicates = parsed.find_all(exp.Predicate)
+        join_predicates = [] # to be processed later
+        query_signature = dict()
+        for predicate in all_predicates:
+            words = str(predicate).split()
+            left, op, right = words[0], words[1], " ".join(words[2:])
+            # single table query
+            if len(list(parsed.find_all(exp.Table))) == 1:
+                table = list(parsed.find_all(exp.Table))[0]
+                left = str(table) + "." + left
+            # skip non-column predicates
+            table, col = self.get_table_by_col(left, alias_dict)
+            if table is None:
+                continue
+            # multi-column predicates
+            ncols = len(list(predicate.find_all(exp.Column)))
+            if ncols == 2:
+                join_predicates.append(predicate)
+                continue
+            elif ncols > 2:
+                self.merge_signature(query_signature, table, col, [1 for _ in range(self.len_sig)])
+                continue
+            # normal predicates
+            signature = [0 for _ in range(self.len_sig)]
+            if self.is_number_expr(right) or (op.upper() == "BETWEEN" and right[-1].isdigit()):
+                if not (table, col) in self.max_values:
+                    self.max_values[(table, col)] = DB_MONITOR.get_max_value(table, col)
+                if not (table, col) in self.min_values:
+                    self.min_values[(table, col)] = DB_MONITOR.get_min_value(table, col)
+                maxv, minv = float(self.max_values[(table, col)]), float(self.min_values[(table, col)])
+                if op.upper() == "BETWEEN":
+                    lb, ub = right.split(" AND ")
+                    lb, ub = float(eval(lb)), float(eval(ub))
+                    bin_idx_lb = int((lb - minv) / (maxv - minv + 1e-5) * self.len_sig)
+                    bin_idx_ub = int((ub - minv) / (maxv - minv + 1e-5) * self.len_sig)
+                    for i in range(bin_idx_lb, min(bin_idx_ub + 1, self.len_sig)):
+                        signature[i] = 1
+                else:
+                    right = float(eval(right))
+                    bin_idx = int((right - minv) / (maxv - minv + 1e-5) * self.len_sig)
+                    # get signature for this predicate
+                    if op == '=':
+                        signature[bin_idx] = 1
+                    elif op in ["<", "<="]:
+                        for i in range(min(bin_idx + 1, self.len_sig)):
+                            signature[i] = 1
+                    elif op in [">", ">="]:
+                        for i in range(bin_idx, self.len_sig):
+                            signature[i] = 1
+                    else:
+                        signature = [1 for _ in range(self.len_sig)]
+            elif "DATE" in right:
+                if not (table, col) in self.max_values:
+                    self.max_values[(table, col)] = DB_MONITOR.get_max_value(table, col)
+                if not (table, col) in self.min_values:
+                    self.min_values[(table, col)] = DB_MONITOR.get_min_value(table, col)
+                maxv, minv = self.max_values[(table, col)], self.min_values[(table, col)]
+                maxv_num = self.convert_date_to_number(str(maxv))
+                minv_num = self.convert_date_to_number(str(minv))
+                if op.upper() == "BETWEEN":
+                    date_lb, date_ub = right.split(" AND ")
+                    date_lb_num = self.convert_date_to_number(date_lb)
+                    date_ub_num = self.convert_date_to_number(date_ub)
+                    date_lb_idx = int((date_lb_num - minv_num) / (maxv_num - minv_num + 1e-5) * self.len_sig)
+                    date_ub_idx = int((date_ub_num - minv_num) / (maxv_num - minv_num + 1e-5) * self.len_sig)
+                    for i in range(date_lb_idx, min(date_ub_idx + 1, self.len_sig)):
+                        signature[i] = 1
+                else:
+                    date_num = self.convert_date_to_number(right)
+                    date_idx = int((date_num - minv_num) / (maxv_num - minv_num + 1e-5) * self.len_sig)
+                    if op == '=':
+                        signature[date_idx] = 1
+                    elif op in ["<", "<="]:
+                        for i in range(min(date_idx + 1, self.len_sig)):
+                            signature[i] = 1
+                    elif op in [">", ">="]:
+                        for i in range(date_idx, self.len_sig):
+                            signature[i] = 1
+                    else:
+                        signature = [1 for _ in range(self.len_sig)]
+            else:
+                signature = [1 for _ in range(self.len_sig)]
+            # merge the signatures
+            self.merge_signature(query_signature, table, col, signature)
+        # process join predicates
+        for predicate in join_predicates:
+            left, right = map(str, predicate.find_all(exp.Column))
+            # single table query
+            if len(list(parsed.find_all(exp.Table))) == 1:
+                table = list(parsed.find_all(exp.Table))[0]
+                left = str(table) + "." + left
+                right = str(table) + "." + right
+            table1, col1 = self.get_table_by_col(left, alias_dict)
+            table2, col2 = self.get_table_by_col(right, alias_dict)
+            if table1 is None or table2 is None:
+                continue
+            signature = [1 for _ in range(self.len_sig)]
+            for table, col in query_signature.keys():
+                if table == table1:
+                    signature = [min(a, b) for a, b in zip(signature, query_signature[(table, col)])]
+            self.merge_signature(query_signature, table1, col1, signature)
+            self.merge_signature(query_signature, table2, col2, signature)
+        return query_signature
+
+    def allocate_batch(self, queries, signatures):
+        # allocate by batches for acceleration
+        remaining_query_indexes = set(range(len(queries)))
+        while remaining_query_indexes:
+            max_score, best_query_idx, target = -1, -1, -1
+            for qidx in remaining_query_indexes:
+                for widx in range(self.n_workers):
+                    if queries[qidx].is_write and widx != 0:
+                        continue
+                    score = 0
+                    for table, col in signatures[qidx].keys():
+                        for history in self.histories[widx]:
+                            if (table, col) in history:
+                                score += sum([a * b for a, b in zip(signatures[qidx][(table, col)], history[(table, col)])])
+                    # prevent starvation of workers with fewer histories
+                    if len(self.histories[widx]) < self.len_hist:
+                        score = 1e8
+                    if score > max_score:
+                        max_score, best_query_idx, target = score, qidx, widx
+            send_to(target, queries[best_query_idx])
+            self.histories[target].append(signatures[best_query_idx])
+            remaining_query_indexes.remove(best_query_idx)
+    
+    def allocate(self, queries):
+        signatures = [self.get_query_signature(query) for query in queries]
+        for i in range(0, len(queries), 50):
+            self.allocate_batch(queries[i : i + 50], signatures[i : i + 50]) # batch size 50
+
 
 class CacheBasedAllocator:
     def __init__(self, n_workers=N_WORKERS, device=DEVICE):
@@ -203,7 +410,7 @@ class CacheBasedAllocator:
                 self.accumulated_costs[0] += predicted_costs[idx]
                 self.centers[0] = (self.centers[0] * (self.query_counts[0] - 1) + predicted_caches[idx]) / self.query_counts[0]
             else:
-                distances = [torch.norm(predicted_caches[idx] - center, p=1) for center in self.centers]
+                distances = [torch.norm(predicted_caches[idx] - center, p=1) / N_BUCKETS / (N_TABLES + N_INDEXES) for center in self.centers]
                 load_factors = [self.accumulated_costs[i] / sum(self.accumulated_costs) for i in range(self.n_workers)]
                 wid = min(range(self.n_workers), key=lambda i: distances[i] + self.w_a * load_factors[i])
                 send_to(wid, queries[idx], predicted_caches[idx])

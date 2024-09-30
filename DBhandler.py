@@ -1,6 +1,7 @@
 import time
 import logging
 import psycopg2
+from datetime import datetime
 from threading import Thread, Event, Lock
 
 from config import *
@@ -21,7 +22,7 @@ class DBhandler(Thread):
     def init(self):
         self.lock = Lock()
         self.finished = Event()
-        self.query_info = -1, ""
+        self.query_info = -1, "", None, None, None
         self.stat_list = []
         self.is_busy = False
         self.connect()
@@ -29,14 +30,17 @@ class DBhandler(Thread):
     def run(self):
         while not self.finished.is_set():
             with self.lock:
-                qid, query_str = self.query_info
+                qid, query_str, txn_str, txn_args, txn_type = self.query_info
                 if qid != -1:
-                    self.query_info = -1, ""
+                    self.query_info = -1, "", None, None, None
             if qid == -1:
                 # wait for new query
                 time.sleep(IDLE_INTERVAL)
                 continue
-            success, exec_time = self.time_single_query(query_str, log_output=False)
+            query_to_execute = query_str if txn_str is None else txn_str
+            if txn_type in ["new_order", "payment", "delivery"]:
+                txn_args[-1] = datetime.fromtimestamp(txn_args[-1])
+            success, exec_time = self.time_single_query(query_to_execute, args=txn_args, log_output=False)
             finish_time = time.time()
             with self.lock:
                 self.stat_list.append((qid, query_str, success, exec_time, finish_time))          
@@ -63,11 +67,11 @@ class DBhandler(Thread):
             time.sleep(IDLE_INTERVAL)
             self.connect()
     
-    def try_execute(self, query, max_retry=3):
+    def try_execute(self, query, args=None, max_retry=3):
         for _ in range(max_retry):
             try:
                 with self.conn.cursor() as cursor:
-                    cursor.execute(query)
+                    cursor.execute(query, args)
                     if cursor.description:
                         return cursor.description, cursor.fetchall(), cursor.rowcount
                     else:
@@ -81,9 +85,9 @@ class DBhandler(Thread):
             logging.error(f"{self.cluster} execution failed: {query}")
         return None, None, -1
     
-    def time_single_query(self, query, log_output=True):
+    def time_single_query(self, query, args=None, log_output=True):
         start = time.time()
-        desc, _, rowcount = self.try_execute(query)
+        desc, _, rowcount = self.try_execute(query, args=args)
         elapsed = time.time() - start
         if log_output:
             logging.info(f"{self.cluster} query time: {elapsed}")

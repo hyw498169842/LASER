@@ -1,0 +1,1 @@
+{"sql": "SELECT payment(%s, %s, %s, %s, %s, %s, %s, %s, %s)", "args": [14, 3, 4, 1508, 158, 1947, false, "PRESOUGHTATION", 915330535.330011], "type": "payment"}

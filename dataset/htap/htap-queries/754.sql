@@ -1,0 +1,1 @@
+{"sql": "SELECT * FROM order_status(%s, %s, %s, %s, %s)", "args": [123, 7, 2712, "ESECALLYANTI", false], "type": "order_status"}
